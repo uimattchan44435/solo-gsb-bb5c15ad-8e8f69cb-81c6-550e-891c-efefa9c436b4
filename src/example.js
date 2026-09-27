@@ -95,3 +95,52 @@ export const EXAMPLE_REBASE_CONFLICT_REQUEST = {
     servers: [{ host: 'b.internal' }],
   },
 };
+
+/**
+ * Canned constraint-preview payload, mirrored in
+ * examples/constraint-preview-request.json. Evaluated against a clean record
+ * created from EXAMPLE_REQUEST it exercises every merged-violation
+ * classification: preexisting, introduced-by-A, introduced-by-B,
+ * introduced-by-both (A and B independently) and combination-only, plus one
+ * rule that passes everywhere.
+ */
+export const EXAMPLE_CONSTRAINT_PREVIEW_REQUEST = {
+  rules: [
+    {
+      id: 'cache-needs-review',
+      when: '/features/cache',
+      equals: true,
+      require: '/features/cache-review',
+    },
+    {
+      id: 'replicas-need-capacity-review',
+      when: '/replicas',
+      equals: 3,
+      require: '/capacity-review',
+    },
+    {
+      id: 'retries-need-budget',
+      when: '/features/retries',
+      equals: 3,
+      require: '/features/retry-budget',
+    },
+    {
+      id: 'tracing-needs-audit',
+      when: '/features/tracing',
+      equals: true,
+      require: '/features/audit',
+    },
+    {
+      id: 'first-server-needs-verification',
+      when: '/servers/0/host',
+      equals: 'a2.internal',
+      require: '/servers/0/verified',
+    },
+    {
+      id: 'app-implies-replicas',
+      when: '/app',
+      equals: 'payment-service',
+      require: '/replicas',
+    },
+  ],
+};

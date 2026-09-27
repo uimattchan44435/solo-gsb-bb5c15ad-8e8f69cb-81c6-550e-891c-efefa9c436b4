@@ -6,12 +6,14 @@ import { previewResolution, DecisionError, DECISION_CODES } from './resolution.j
 import { buildRoundTripPlan } from './roundtrip.js';
 import { computeProvenance } from './provenance.js';
 import { rebasePatch } from './rebase.js';
+import { previewConstraints, validateRules, ConstraintError } from './constraint.js';
 import { MergeStore } from './store.js';
 import {
   EXAMPLE_REQUEST,
   EXAMPLE_CONFLICT_REQUEST,
   EXAMPLE_REBASE_REQUEST,
   EXAMPLE_REBASE_CONFLICT_REQUEST,
+  EXAMPLE_CONSTRAINT_PREVIEW_REQUEST,
 } from './example.js';
 
 export const VERSION = '1.0.0';
@@ -66,6 +68,17 @@ const resolutionBodySchema = {
         },
       },
     },
+  },
+};
+
+const constraintBodySchema = {
+  type: 'object',
+  required: ['rules'],
+  additionalProperties: false,
+  properties: {
+    // Per-rule shape is validated in the handler so that invalid rules are
+    // reported as 422 (INVALID_RULES) with per-rule details, not as 400.
+    rules: { type: 'array' },
   },
 };
 
@@ -135,6 +148,8 @@ export function buildApp(options = {}) {
         'deterministic RFC 6902 forward (base -> merged) and rollback (merged -> base) patches, replayed server-side',
       'GET /api/v1/merges/:id/provenance':
         'per-leaf source attribution (base / A / B / both) of a clean merge at final JSON Pointers, with contributing operation indices',
+      'POST /api/v1/merges/:id/constraint-preview':
+        'evaluate conditional rules (when <pointer> deep-equals <value>, another <pointer> must exist) on base / A-only / B-only / merged of a clean record and classify merged violations (preexisting / introduced-by-A / introduced-by-B / combination-only), without modifying it',
       'POST /api/v1/rebases':
         'rebase { base, patch, onto }: merge the client patch with the base->onto delta and return merged plus an onto-relative rebasedPatch (replayed server-side), or structured conflicts',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
@@ -148,6 +163,10 @@ export function buildApp(options = {}) {
     rebaseDescription: 'POST the bodies below to /api/v1/rebases',
     rebaseRequest: EXAMPLE_REBASE_REQUEST,
     rebaseConflictRequest: EXAMPLE_REBASE_CONFLICT_REQUEST,
+    constraintPreviewDescription:
+      'POST the body below to /api/v1/merges/:id/constraint-preview ' +
+      '(use the id of a clean merge record, e.g. one created from mergeRequest)',
+    constraintPreviewRequest: EXAMPLE_CONSTRAINT_PREVIEW_REQUEST,
   }));
 
   app.post('/api/v1/merges', { schema: { body: mergeBodySchema } }, async (req, reply) => {
@@ -337,6 +356,57 @@ export function buildApp(options = {}) {
         dropped: preview.dropped,
         stats: preview.stats,
       });
+    },
+  );
+
+  app.post(
+    '/api/v1/merges/:id/constraint-preview',
+    { schema: { body: constraintBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      if (record.status !== 'clean') {
+        // Only clean records carry a merged document to evaluate. The stored
+        // record is never modified.
+        return reply.code(409).send({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            `rehearsal ${req.params.id} has status "${record.status}"; ` +
+            'constraint preview requires a clean merge record',
+        });
+      }
+      let rules;
+      try {
+        rules = validateRules(req.body.rules);
+      } catch (err) {
+        if (err instanceof ConstraintError) {
+          return reply.code(422).send({
+            statusCode: 422,
+            error: 'Unprocessable Entity',
+            code: err.code,
+            message: err.message,
+            ...err.details,
+          });
+        }
+        throw err;
+      }
+      // Pure preview: the stored record is never modified. Single-side
+      // states are computed with the same base-coordinate merge semantics
+      // as the stored merge.
+      const preview = previewConstraints(record, rules);
+      return {
+        id: record.id,
+        createdAt: record.createdAt,
+        status: record.status,
+        ...preview,
+      };
     },
   );
 
