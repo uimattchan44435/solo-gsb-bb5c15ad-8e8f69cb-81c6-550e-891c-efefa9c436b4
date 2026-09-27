@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "id": "tracing-requires-retries",
+      "when": { "path": "/features/tracing", "equals": true },
+      "require": { "path": "/features/retries" }
+    },
+    {
+      "id": "tracing-requires-region",
+      "when": { "path": "/features/tracing", "equals": true },
+      "require": { "path": "/region" }
+    },
+    {
+      "id": "replicas-requires-three-servers",
+      "when": { "path": "/replicas", "equals": 3 },
+      "require": { "path": "/servers/2" }
+    }
+  ]
+}

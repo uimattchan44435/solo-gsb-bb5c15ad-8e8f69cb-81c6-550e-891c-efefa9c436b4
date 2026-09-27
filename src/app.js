@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
 import { auditOrdering } from './audit.js';
 import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
+import { previewConstraints, ConstraintError } from './constraint.js';
 import { buildRoundTripPlan } from './roundtrip.js';
 import { computeProvenance } from './provenance.js';
 import { rebasePatch } from './rebase.js';
@@ -63,6 +64,42 @@ const resolutionBodySchema = {
         properties: {
           conflict: { type: 'integer', minimum: 0 },
           winner: { type: 'string', enum: ['A', 'B'] },
+        },
+      },
+    },
+  },
+};
+
+const constraintBodySchema = {
+  type: 'object',
+  required: ['rules'],
+  additionalProperties: false,
+  properties: {
+    rules: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', 'when', 'require'],
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', minLength: 1 },
+          when: {
+            type: 'object',
+            required: ['path', 'equals'],
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string' },
+              equals: true,
+            },
+          },
+          require: {
+            type: 'object',
+            required: ['path'],
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string' },
+            },
+          },
         },
       },
     },
@@ -131,6 +168,8 @@ export function buildApp(options = {}) {
         'replay saved patches A→B and B→A under strict RFC 6902 ordering (commutative / divergent / failed)',
       'POST /api/v1/merges/:id/resolution-preview':
         'preview per-conflict winner decisions (A/B) on a conflict record without modifying it',
+      'POST /api/v1/merges/:id/constraint-preview':
+        'evaluate conditional rules (when pointer P deep-equals V, pointer Q must exist) on base / A-only / B-only / merged of a clean record, classifying merged violations as pre-existing / introduced-by-A / introduced-by-B / combination-only, without modifying the record',
       'GET /api/v1/merges/:id/round-trip-plan':
         'deterministic RFC 6902 forward (base -> merged) and rollback (merged -> base) patches, replayed server-side',
       'GET /api/v1/merges/:id/provenance':
@@ -336,6 +375,55 @@ export function buildApp(options = {}) {
         retained: preview.retained,
         dropped: preview.dropped,
         stats: preview.stats,
+      });
+    },
+  );
+
+  app.post(
+    '/api/v1/merges/:id/constraint-preview',
+    { schema: { body: constraintBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      if (record.status !== 'clean') {
+        // Only clean records carry a merged document to evaluate against.
+        // The stored record is never modified.
+        return reply.code(409).send({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            `rehearsal ${req.params.id} has status "${record.status}"; ` +
+            'constraint preview requires a clean merge record',
+        });
+      }
+      let preview;
+      try {
+        preview = previewConstraints(record, req.body.rules);
+      } catch (err) {
+        if (err instanceof ConstraintError) {
+          return reply.code(422).send({
+            statusCode: 422,
+            error: 'Unprocessable Entity',
+            code: err.code,
+            message: err.message,
+            ...err.details,
+          });
+        }
+        throw err;
+      }
+      // Pure preview: the stored record is never modified and identical
+      // requests serialize byte-for-byte.
+      return reply.code(200).send({
+        id: record.id,
+        createdAt: record.createdAt,
+        status: record.status,
+        ...preview,
       });
     },
   );

@@ -61,6 +61,7 @@ npm ci && npm start
 | `GET` | `/api/v1/merges/:id` | 查询单条预演（含输入与结果） |
 | `GET` | `/api/v1/merges/:id/order-audit` | 对已保存输入按严格 RFC 6902 顺序重放 A→B 与 B→A，判定可交换性 |
 | `POST` | `/api/v1/merges/:id/resolution-preview` | 对冲突记录按冲突序号提交胜方决定（A/B），预览解决结果（不修改记录） |
+| `POST` | `/api/v1/merges/:id/constraint-preview` | 对干净合并记录提交条件约束规则（当指针 P 的值深度等于 V 时指针 Q 必须存在），在基准 / A 单独 / B 单独 / 合并结果四种状态上评估并归类合并结果中的违规来源（不修改记录） |
 | `GET` | `/api/v1/merges/:id/round-trip-plan` | 为干净合并记录生成确定性 RFC 6902 forward（base→merged）/ rollback（merged→base）补丁，服务端重放校验后返回 |
 | `GET` | `/api/v1/merges/:id/provenance` | 干净合并记录的叶子级来源追踪：`merged` 每个叶子路径标注 `base` / `A` / `B` / `both` 及贡献操作的原始序号 |
 | `POST` | `/api/v1/rebases` | 变基预演：把基于 `base` 的 `patch` 迁移到新版本 `onto`，返回 `merged` 与相对 `onto` 的 `rebasedPatch`（服务端重放校验），冲突时不返回可执行补丁 |
@@ -249,6 +250,125 @@ curl -s -X POST "http://localhost:3000/api/v1/merges/$id/resolution-preview" \
   -H 'Content-Type: application/json' \
   -d @examples/resolution-preview-request.json | jq
 # => 200, merged: { "mode": "readonly" }；记录本身仍为 conflict，可换其他决定重试
+```
+
+### `POST /api/v1/merges/:id/constraint-preview`（条件约束预检）
+
+对一条 **`status` 为 `clean`** 的已保存记录，提交一组**带唯一 `id` 的条件约束规则**：
+
+> 当 `when.path`（JSON Pointer）指向的值与 `when.equals`（任意 JSON 值）**深度相等**时，
+> `require.path` 必须存在。
+
+每条规则分别在**四种状态**上求值：
+
+| 状态 | 文档 |
+| --- | --- |
+| `base` | 保存时的基准文档 |
+| `A` | 基准 + `patchA` 单独变更，**沿用基准坐标合并语义**（数组下标按基准元素寻址、删除重定位、同缝隙 A 后 B） |
+| `B` | 基准 + `patchB` 单独变更，同上 |
+| `merged` | 保存的合并结果 |
+
+前提不成立（指针不存在或值不相等）时规则**恒通过**；前提成立时才检查 `require.path`
+是否存在。**预检不会修改已保存的记录**，同一记录同一请求重复提交返回**逐字节一致**的结果。
+
+请求体（也见 `examples/constraint-preview-request.json`）：
+
+```json
+{
+  "rules": [
+    {
+      "id": "tracing-requires-retries",
+      "when": { "path": "/features/tracing", "equals": true },
+      "require": { "path": "/features/retries" }
+    },
+    {
+      "id": "tracing-requires-region",
+      "when": { "path": "/features/tracing", "equals": true },
+      "require": { "path": "/region" }
+    }
+  ]
+}
+```
+
+- `id`：非空字符串，**请求内唯一**；`when.equals` 可以是任意 JSON 值（含 `null`、对象、数组），
+  按深度相等比较（键序无关）。
+- 指针按 RFC 6901 转义（`~` → `~0`、`/` → `~1`）；`""` 指向文档根；数组段须为十进制下标，
+  越界与 `-` 一律视为不存在。
+
+#### 响应结构（`200`）
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "status": "clean",
+  "rules": [
+    {
+      "id": "tracing-requires-region",
+      "when": { "path": "/features/tracing", "equals": true },
+      "require": { "path": "/region" },
+      "states": {
+        "base":   { "pass": true,  "whenExists": true, "whenMatched": false, "requireExists": null },
+        "A":      { "pass": false, "whenExists": true, "whenMatched": true,  "requireExists": false },
+        "B":      { "pass": false, "whenExists": true, "whenMatched": true,  "requireExists": false },
+        "merged": { "pass": false, "whenExists": true, "whenMatched": true,  "requireExists": false }
+      },
+      "mergedViolation": { "origins": ["introduced-by-A", "introduced-by-B"] }
+    }
+    // …按请求顺序排列的全部规则
+  ],
+  "summary": {
+    "total": 2,
+    "violations": { "base": 0, "A": 2, "B": 1, "merged": 1 },
+    "mergedViolations": { "pre-existing": 0, "introduced-by-A": 1, "introduced-by-B": 1, "combination-only": 0 }
+  }
+}
+```
+
+每个状态的评估细节：
+
+- `pass`：该状态下规则是否通过；
+- `whenExists` / `whenMatched`：前提指针是否存在 / 是否存在且深度相等；
+- `requireExists`：前提匹配时 `require.path` 是否存在；前提不匹配时为 `null`（未检查）。
+
+#### 合并违规的来源归类（`mergedViolation.origins`）
+
+仅当规则在 `merged` 中违规时非空（否则为 `null`），取值为：
+
+| `origins` | 含义 |
+| --- | --- |
+| `pre-existing` | **既存**：基准文档已违规（此时不再标注 A/B） |
+| `introduced-by-A` | **A 引入**：基准不违规，A 单独变更违规 |
+| `introduced-by-B` | **B 引入**：基准不违规，B 单独变更违规 |
+| `combination-only` | **仅组合后出现**：基准、A 单独、B 单独都不违规，只有合并结果违规 |
+
+**两侧均单独违规时同时标出 A/B**：`origins` 为 `["introduced-by-A", "introduced-by-B"]`。
+因此 `summary.mergedViolations` 各项之和可能大于 `summary.violations.merged`。
+
+#### 状态码与确定性
+
+- **干净记录 → `200`**：返回上述结构（规则在 `merged` 中违规不影响状态码，违规是数据而非错误）。
+- **规则无效 → `422`**：`{ statusCode, error, code: "INVALID_RULES", duplicates, invalid }`——
+  `duplicates` 列出重复的 `id` 及其全部出现序号，`invalid` 逐条给出非法指针的
+  规则序号、`id`、字段（`when.path` / `require.path`）与原因。
+- **记录不存在 → `404`**；**记录是冲突状态 → `409`**（无 `merged` 可评估，且不修改记录）；
+  请求体结构不合法（缺 `rules`、规则缺字段、`id` 为空等）→ `400`。
+- 预检是已保存记录与请求规则的**纯函数**：不修改记录，同一请求重复提交逐字节一致。
+
+完整流程示例：
+
+```bash
+# 1) 提交干净合并示例，记下返回的记录 id
+id=$(curl -s -X POST http://localhost:3000/api/v1/merges \
+  -H 'Content-Type: application/json' \
+  -d @examples/merge-request.json | jq -r .id)
+
+# 2) 约束预检：tracing 开启时要求 retries / region 存在
+curl -s -X POST "http://localhost:3000/api/v1/merges/$id/constraint-preview" \
+  -H 'Content-Type: application/json' \
+  -d @examples/constraint-preview-request.json | jq
+# => 200；tracing-requires-retries 仅在 A 单独状态违规（B 会补上 retries，合并结果通过），
+#    tracing-requires-region 在合并结果中违规且 origins 同时标出 A 与 B
 ```
 
 ### `GET /api/v1/merges/:id/round-trip-plan`（往返补丁计划）
@@ -574,6 +694,9 @@ curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq  # 顺序审�
 curl -s -X POST http://localhost:3000/api/v1/merges/<id>/resolution-preview \
   -H 'Content-Type: application/json' \
   -d @examples/resolution-preview-request.json | jq       # 冲突解决预览
+curl -s -X POST http://localhost:3000/api/v1/merges/<id>/constraint-preview \
+  -H 'Content-Type: application/json' \
+  -d @examples/constraint-preview-request.json | jq       # 条件约束预检（四状态评估 + 违规来源归类）
 curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq  # forward / rollback 补丁
 curl -s http://localhost:3000/api/v1/merges/<id>/provenance | jq       # 叶子来源追踪（base/A/B/both）
 curl -s -X POST http://localhost:3000/api/v1/rebases \
@@ -638,7 +761,11 @@ npm test
 非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查，顺序审计的
 可交换 / 发散（RFC 6901 字典序最小差异）/ 失败（失败方、原始序号、失败前文档）判定与
 重复查询确定性，冲突解决预览的胜方保留 / 败方剔除、覆盖校验（`400`）、
-矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性，以及往返补丁计划的
+矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性，条件约束预检的
+四状态（基准 / A 单独 / B 单独 / 合并）评估、既存 / A 引入 / B 引入 / 仅组合后出现的
+来源归类（含双侧同时标出 A/B）、前提未命中恒通过、深度相等与指针转义、根指针与数组下标、
+单侧基准坐标语义（删除重定位）、重复 `id` 与非法指针（`422`）、schema 校验（`400`）、
+冲突记录 `409`、未知记录 `404`、记录不变与重复请求逐字节一致，以及往返补丁计划的
 对象字典序与 JSON Pointer 转义、数组 LCS 对齐（删除降序 / 插入升序）、根替换、
 前向与回滚重放校验、操作数统计、干净记录可用 / 冲突记录 `409` 且不改记录 / 未知 `404`
 与重复请求逐字节一致，以及叶子来源追踪的 base / A / B / both 归属（相同值双边写入）、
@@ -658,6 +785,7 @@ rebasedPatch 重放校验、同缝隙上游优先定序、冲突 `409`（路径/
 │   ├── merge.js               # 合并引擎：规范化 → 补丁内解析 → 跨补丁冲突检测 → 应用
 │   ├── audit.js               # 顺序审计：严格 RFC 6902 顺序重放 A→B / B→A、失败捕获、字典序最小差异
 │   ├── resolution.js          # 冲突解决预览：胜方决定校验 → 剔除败方 → 复用合并引擎（纯函数，不写存储）
+│   ├── constraint.js          # 条件约束预检：规则校验 → 基准/A/B/合并四状态求值（单侧复用基准坐标合并管线）→ 合并违规来源归类
 │   ├── roundtrip.js           # 往返补丁：字典序对象 diff + 数组 LCS（删除降序/插入升序）→ RFC 6902 forward/rollback，服务端重放校验
 │   ├── provenance.js          # 叶子来源追踪：在带来源标签的镜像文档上重放基准坐标合并，归属 merged 每个叶子（base/A/B/both）
 │   ├── rebase.js              # 变基：base→onto 转基准坐标操作（数组 LCS 对齐、缝隙插入）→ 与客户端补丁合并 → 生成并重放校验 onto 相对补丁
@@ -683,6 +811,11 @@ rebasedPatch 重放校验、同缝隙上游优先定序、冲突 `409`（路径/
   基准坐标合并管线，把 `merged` 每个叶子归属到 `base` / `A` / `B` / `both` 并列出贡献
   操作的原始序号；路径为最终 JSON Pointer，按 UTF-16 码元序排序，结果按记录缓存，
   重复请求逐字节一致；仅干净合并记录可用，冲突记录返回 `409`。
+- 条件约束预检（`POST /api/v1/merges/:id/constraint-preview`）是干净记录的只读预检：
+  规则（`when.path` 深度等于 `when.equals` 时 `require.path` 必须存在）在基准、A 单独、
+  B 单独与合并结果四种状态上求值，单侧文档由同一基准坐标合并管线生成；合并结果中的
+  违规按来源归类为既存 / A 引入 / B 引入 / 仅组合后出现（两侧均单独违规时同时标出
+  A/B）；预检不修改记录，同一请求重复提交逐字节一致；冲突记录返回 `409`。
 - 变基（`POST /api/v1/rebases`）是无状态预演：不写内存存储、不返回记录 `id`；`upstream`
   为 `base`→`onto` 的基准坐标操作（数组合并按缝隙寻址，不能直接当顺序补丁执行），
   `rebasedPatch` 才是相对 `onto` 的可执行 RFC 6902 补丁（服务端已重放校验等于 `merged`）；
